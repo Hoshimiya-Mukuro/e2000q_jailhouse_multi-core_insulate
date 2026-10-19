@@ -1,0 +1,219 @@
+================================================================================
+  JsonMsgHandleCell 程序修改日志
+  日期: 2026-04-29
+  修改原因: 源码存在编译错误和运行时逻辑缺陷，无法通过编译及正常运行
+================================================================================
+
+一、编译与审查方法
+--------------------------------------------------------------------------------
+  编译器: gcc
+  编译选项: -Wall -Wextra -pedantic -std=c99
+  涉及文件: main.c, commMsg.h, commMsg.c, handleJson.h, handleJson.c,
+            ringBuf.h, cJSON.c, cJSON.h
+
+
+二、修复清单（共 10 项）
+--------------------------------------------------------------------------------
+
+  [问题 1] handleJson.c:68 — 函数签名与头文件不一致（致命编译错误）
+  ------------------------------------------------------------------
+  位置: handleJson.c 第68行
+  原代码:
+    int analysisSensorDataJson(char* json_str, struct SenserData data)
+
+  问题:
+    (a) 头文件 handleJson.h:25 声明为 SenserData *data (指针)，此处为值传递
+    (b) "struct SenserData" 在参数列表中前向声明，类型不完整，GCC 直接报错:
+        error: parameter 2 ('data') has incomplete type
+    (c) 值传递导致函数内对 data 的所有修改不反映到调用者
+
+  修复后:
+    int analysisSensorDataJson(char* json_str, SenserData *data)
+
+  连带修改: 函数体内所有 data.xxx 改为 data->xxx（共 6 处）
+
+
+  [问题 2] handleJson.c:119 — 非 void 函数无返回值
+  ------------------------------------------------------------------
+  位置: handleJson.c 原第119行（函数末尾）
+  原代码: 函数以 cJSON_Delete(root); } 结尾，无 return 语句
+
+  问题: 函数声明返回 int，成功路径控制流抵达函数末尾却没有返回值，
+        属于未定义行为
+
+  修复后: 在 cJSON_Delete(root); 后添加 return 1;
+
+
+  [问题 3] handleJson.c — createSensorDataJson 生成 JSON 后直接丢弃
+  ------------------------------------------------------------------
+  位置: handleJson.c 第31-59行
+  原代码: cJSON_Print 生成 JSON 字符串后，注释掉的代码存在错误:
+    outJson=malloc(strlen(json_str)+1);  // 仅修改局部指针，调用者拿不到
+  随后 free(json_str) 丢弃了生成结果
+
+  问题: 函数名为 "create" + "outJson"，但实际没有任何输出
+
+  修复后: 删除注释块，改为 strcpy(outJson, json_str);
+          outJson 作为调用者预分配的缓冲区使用
+
+
+  [问题 4] commMsg.h:16-17 — static 变量定义在头文件中
+  ------------------------------------------------------------------
+  位置: commMsg.h 第16-17行
+  原代码:
+    static RingBuffer *tx_rb = NULL;
+    static RingBuffer *rx_rb = NULL;
+
+  问题: 头文件中的 static 变量定义会使每个包含该头文件的 .c 文件
+        各自产生独立副本，违背共享意图
+
+  修复后: 将这两行从头文件删除，移到 commMsg.c 文件作用域
+
+
+  [问题 5] commMsg.c — tx_rb/rx_rb 定义缺失
+  ------------------------------------------------------------------
+  位置: commMsg.c 顶部（新增）
+  原代码: 无（变量仅在头文件中定义，移除后无处定义）
+
+  修复后: 在 commMsg.c 第3-5行添加:
+    static RingBuffer *tx_rb = NULL;
+    static RingBuffer *rx_rb = NULL;
+
+
+  [问题 6] commMsg.c:27 — 环形缓冲区最大消息长度 off-by-one
+  ------------------------------------------------------------------
+  位置: commMsg.c send_to_root 函数（原第23行，现第27行）
+  原代码:
+    if (len > DATA_AREA_SIZE - 2) return -1;
+
+  问题: ringbuf_full 判定条件为 (w+1) % D == r，即缓冲区最多容纳
+        D-1 字节。消息格式为 2字节长度头 + N字节数据 = 2+N 字节总量。
+        当 N = D-2 时，总量 = D，写入后 w == r，缓冲区被误判为空，
+        下一条消息将覆盖未读数据。
+
+        具体数值: D = 0x1FF8 = 8184
+        原代码允许 N ≤ 8182，但最大安全值为 N ≤ 8181
+
+  修复后:
+    if (len > DATA_AREA_SIZE - 3) return -1;
+    // 总长=2+len，缓冲区最多容纳 D-1 字节
+
+
+  [问题 7] main.c:26 — jsonMsg 指针未初始化
+  ------------------------------------------------------------------
+  位置: main.c 原第26行
+  原代码:
+    char *jsonMsg;
+
+  问题: 未分配内存即传入 recv_from_root，函数向野指针写入数据，
+        必然段错误
+
+  修复后:
+    #define JSON_BUF_SIZE 4096
+    char *jsonMsg = malloc(JSON_BUF_SIZE);
+    并检查 malloc 返回值，失败则退出
+
+
+  [问题 8] main.c:31 — recv_from_root 参数类型错误
+  ------------------------------------------------------------------
+  位置: main.c 原第31行
+  原代码:
+    int flag_0=recv_from_root((uint8_t*) jsonMsg, rx_len);
+
+  问题: recv_from_root 第二个参数声明为 uint32_t *len，
+        此处传入的是 uint32_t 值（且 rx_len 未初始化），
+        函数内部 *len = msg_len 会将垃圾值当作地址写入
+
+  修复后:
+    int flag_0 = recv_from_root((uint8_t*)jsonMsg, &rx_len);
+
+
+  [问题 9] main.c — 接收逻辑颠倒
+  ------------------------------------------------------------------
+  位置: main.c 原第32-36行
+  原代码:
+    if(flag_0==0)
+    {
+        printf("no data");
+        toStop--;
+        continue;
+    }
+
+  问题: recv_from_root 返回值约定为 0=成功收到数据, -1=无数据。
+        原代码在 flag_0==0 (成功) 时打印 "no data" 并跳过处理；
+        在 flag_0!=0 (无数据) 时反而继续调用解析函数处理空数据。
+
+  修复后:
+    if (flag_0 != 0)   // 无数据到达
+    {
+        printf("no data\n");
+        toStop--;
+        sleep(1);
+        continue;
+    }
+
+
+  [问题 10] main.c — init_shm() 从未被调用
+  ------------------------------------------------------------------
+  位置: main.c（缺失）
+  原代码: 没有调用 init_shm()
+
+  问题: tx_rb 和 rx_rb 始终为 NULL，send_to_root/recv_from_root
+        中访问 tx_rb->xxx / rx_rb->xxx 直接空指针解引用崩溃
+
+  修复后: 在 while 循环前添加:
+    if (init_shm() != 0) {
+        fprintf(stderr, "共享内存初始化失败，退出。\n");
+        return -1;
+    }
+
+
+三、附加改进
+--------------------------------------------------------------------------------
+
+  [改进 1] 信号处理注册
+  原代码定义了 sig_handler 但未注册，添加 signal(SIGINT, ...)
+  和 signal(SIGTERM, ...) 使其生效
+
+  [改进 2] JSON 字符串终止符
+  收到数据后在 jsonMsg[rx_len] 写入 '\0'，确保字符串安全
+
+  [改进 3] anaData 结构体清零
+  memset(&anaData, 0, sizeof(anaData)) 避免解析不完整时残留脏数据
+
+  [改进 4] 编译警告消除
+  添加 (void)argc; (void)argv; 消除未使用参数警告
+
+
+四、编译结果
+--------------------------------------------------------------------------------
+  修改前: 1 个 error, 10 个 warning — 编译失败
+  修改后: 0 个 error,  0 个 warning — 编译通过
+
+  编译命令:
+  gcc -Wall -Wextra -pedantic -std=c99 -o program \
+      main.c commMsg.c handleJson.c cJSON.c -lm
+
+
+五、程序运行流程
+--------------------------------------------------------------------------------
+  1. 注册 SIGINT/SIGTERM 信号处理函数
+  2. init_shm(): open("/dev/mem") → mmap 物理地址 0xb1004000 (16KB)
+     → 设置 tx_rb 指向 offset 0x0000, rx_rb 指向 offset 0x2000
+  3. malloc(4096) 分配 JSON 接收缓冲区
+  4. 进入主循环 (最多连续失败 ERROR_T=10 次后退出):
+     a. recv_from_root(&rx_rb, jsonMsg, &rx_len)
+        从 B→A 通道读取: 2字节长度头 + N字节 JSON 数据
+     b. 无数据 → 计数器减1，sleep(1)，continue
+     c. analysisSensorDataJson(jsonMsg, &anaData)
+        解析 JSON 各字段 → 填充 SenserData 结构体
+     d. send_to_root(&tx_rb, &anaData, sizeof(anaData))
+        将结构体二进制写入 A→B 通道回传主核
+     e. 缓冲区满 → 计数器减1
+     f. sleep(1)
+  5. 收到信号或计数器归零 → free(jsonMsg) → 退出
+
+
+
+
+================================================================================

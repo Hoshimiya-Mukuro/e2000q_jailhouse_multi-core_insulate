@@ -1,0 +1,390 @@
+================================================================================
+  QT_MQTT_UI 主核 Qt 程序修改日志
+  日期: 2026-04-29
+  修改原因: 添加共享内存通信、SQLite 持久化、光照图表、设备状态等功能
+================================================================================
+
+一、原始程序分析
+--------------------------------------------------------------------------------
+  原始程序功能:
+    1. 使用 QMqttClient 连接 MQTT Broker (192.168.79.1:1883)，订阅 "test/topic"
+    2. 使用 readingDataThread 通过串口 /dev/ttyS0 读取传感器数据
+    3. simulateDataUpdate() 自行生成模拟温度/湿度数据
+    4. 温度 + 湿度两张实时曲线图表 (QLineSeries)
+    5. 表格模式可切换查看数据 (10 行保留)
+    6. 底部按钮栏: 报警阈值、导出数据(空)、刷新(空)、设置(空)
+
+  原始程序缺陷:
+    a. mqttClient 在 MainWindow 构造函数中作为局部变量创建，构造后立即销毁，
+       导致 MQTT 连接建立后立刻断开
+    b. simulateDataUpdate() 使用随机数据模拟，未使用真实传感器数据
+    c. readingDataThread 使用串口而非共享内存，无法与副核通信
+    d. on_btnExport_clicked() 为空实现，无法导出数据
+    e. 无数据持久化机制
+    f. 无光照数据显示
+
+
+二、新增文件清单（5 个文件）
+--------------------------------------------------------------------------------
+
+  [1] sensordata.h
+  ------------------------------------------------------------------
+  路径: QT_MQTT_UI/sensordata.h
+  用途: 定义 SensorData 结构体，与副核 handleJson.h 中的 SenserData
+        保持字节级兼容（使用 #pragma pack(push, 1)）
+  结构体布局:
+    struct SensorData {
+        char deviceId[64];     // 设备 ID（64 字节）
+        double temperature;    // 温度（8 字节）
+        double humidity;       // 湿度（8 字节）
+        int light;             // 光照（4 字节）
+        char status[16];       // 状态字符串（16 字节）
+        long timestamp;        // 时间戳（8 字节，ARM64）
+    };  // 总计 108 字节（pack(1) 无对齐填充）
+
+
+  [2] shmcommunicator.h / shmcommunicator.cpp
+  ------------------------------------------------------------------
+  路径: QT_MQTT_UI/shmcommunicator.h, shmcommunicator.cpp
+  用途: 封装与副核共享内存通信的完整逻辑
+
+  RingBuffer 结构体（与副核 ringBuf.h 完全一致）:
+    struct RingBuffer {
+        volatile uint32_t write_ptr;   // 写指针（生产者更新）
+        volatile uint32_t read_ptr;    // 读指针（消费者更新）
+        uint8_t data[DATA_AREA_SIZE];  // 数据区 (8184 字节)
+    };
+
+  共享内存布局:
+    物理基址:     0xb1004000
+    映射大小:     16KB (0x4000)
+    A→B 通道:     offset 0x0000 (副核写 → 主核读)
+    B→A 通道:     offset 0x2000 (主核写 → 副核读)
+    单通道大小:   8KB (0x2000)
+    数据区大小:   8184 字节 (8KB - 8字节头部)
+
+  主要方法:
+    init()              - 打开 /dev/mem 并 mmap 共享内存
+    sendToSecondary()   - 将数据写入 B→A 通道（主核→副核）
+    recvFromSecondary() - 从 A→B 通道读取数据（副核→主核）
+    statusInfo()        - 返回通信状态详情字符串
+
+  通信协议（与副核 commMsg.c 一致）:
+    消息格式: 2 字节小端长度头 + N 字节数据体
+    写入流程: 写入长度头 → 写入数据 → __sync_synchronize() → 更新写指针
+    读取流程: 读取长度头 → 读取数据 → __sync_synchronize() → 更新读指针
+    空判断:   write_ptr == read_ptr
+    满判断:   (write_ptr + 1) % DATA_AREA_SIZE == read_ptr
+    最大载荷: DATA_AREA_SIZE - 3 = 8181 字节
+
+
+  [3] databasemanager.h / databasemanager.cpp
+  ------------------------------------------------------------------
+  路径: QT_MQTT_UI/databasemanager.h, databasemanager.cpp
+  用途: SQLite 数据库管理，实现数据持久化
+
+  数据库表结构:
+    CREATE TABLE IF NOT EXISTS sensor_readings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        temperature REAL,
+        humidity REAL,
+        light INTEGER,
+        status TEXT
+    )
+
+  主要方法:
+    init(dbPath)      - 初始化 SQLite 数据库（默认路径 ~/.local/share/...）
+    insertRecord()    - 插入一条传感器记录
+    exportToCsv()     - 导出全部数据为 CSV 文件（含 BOM 头，兼容 Excel）
+    recordCount()     - 查询当前记录总数
+
+
+三、修改文件清单（7 个文件）
+--------------------------------------------------------------------------------
+
+  [4] mqttclient.h / mqttclient.cpp
+  ------------------------------------------------------------------
+  修改内容:
+    a. 新增信号: jsonMessageReceived(const QByteArray &json)
+       - 当 MQTT 收到订阅消息后，通过此信号将原始 JSON 转发出去
+    b. 新增方法: isConnected()
+       - 返回 MQTT 连接状态 (QMqttClient::Connected)
+    c. onMessageReceived() 中增加 emit jsonMessageReceived(message)
+       - 将收到的 MQTT 消息通过信号发出，供 MainWindow 接收并写入共享内存
+    d. 添加 ~mqttClient() 默认析构函数声明
+
+
+  [5] readingdatathread.h / readingdatathread.cpp
+  ------------------------------------------------------------------
+  修改内容:
+    a. 移除: QSerialPort 相关代码
+    b. 新增: ShmCommunicator 指针成员，通过构造函数注入
+    c. 信号变更:
+       原: dataReady(float temp, float humidity)
+       新: dataReady(const SensorData &data)         // 发射完整结构体
+       新: commError(const QString &errorMsg)        // 通信错误通知
+    d. run() 改为每 500ms 轮询共享内存 A→B 通道:
+       - 调用 m_shm->recvFromSecondary() 检查是否有新数据
+       - 验证数据长度是否等于 sizeof(SensorData)
+       - 将原始字节 memcpy 为 SensorData 结构体
+       - emit dataReady(data) 发射给主窗口
+    e. stop() 设置 m_isRunning = false 停止轮询
+    f. 析构函数: 停止线程并等待最多 2 秒
+
+
+  [6] mainwindow.h
+  ------------------------------------------------------------------
+  修改内容:
+    a. 新增前置声明: mqttClient, ShmCommunicator, DatabaseManager
+    b. 新增成员变量:
+       - mqttClient *m_mqtt          // MQTT 客户端（修复原局部变量 bug）
+       - ShmCommunicator *m_shm       // 共享内存通信器
+       - DatabaseManager *m_db        // SQLite 数据库管理器
+       - QPushButton *btnLightChart   // 光照图表导航按钮
+       - QPushButton *btnStatus       // 设备状态按钮
+       - QLabel *m_statusLabel        // 通信状态实时标签
+       - 光照图表相关 (lightChartView/lightChart/lightSeries/lightAxisX/Y)
+       - int m_dataCount, m_lightDataCount
+    c. 删除: simulateDataUpdate() 槽函数
+    d. 新增槽函数:
+       - switchToLightChart()               // 切换到光照图表页
+       - showStatusDialog()                  // 弹出设备状态对话框
+       - onMqttMessageReceived(QByteArray)   // MQTT 消息 → 共享内存
+       - onSensorDataReady(SensorData)       // 副核数据 → UI 更新
+       - onCommError(QString)                // 通信错误处理
+    e. 新增私有方法:
+       - initLightChart()     // 光照图表初始化
+       - initSharedMemory()   // 共享内存初始化
+       - initDatabase()       // 数据库初始化
+       - updateStatusBar()    // 状态标签更新
+       - appendTableRow()     // 表格追加行
+
+
+  [7] mainwindow.cpp
+  ------------------------------------------------------------------
+  修改内容:
+    a. 构造函数重构:
+       - 调用 initSharedMemory() → 打开 /dev/mem 并 mmap
+       - 调用 initDatabase()     → 打开 SQLite 数据库
+       - mqttClient 改为成员变量 (new mqttClient(this))，不再局部变量
+       - 连接 mqttClient::jsonMessageReceived → onMqttMessageReceived
+       - 连接 readingDataThread::dataReady → onSensorDataReady
+       - 连接 readingDataThread::commError → onCommError
+       - 程序化创建 m_statusLabel 插入顶部状态栏
+       - 程序化创建 btnLightChart / btnStatus 插入模式切换栏
+       - 移除 simulateDataUpdate 连接，timer 仅更新时间
+
+    b. onMqttMessageReceived() 实现:
+       MQTT 收到 JSON → m_shm->sendToSecondary() 写入 B→A 通道
+       → 副核从共享内存读取并处理
+
+    c. onSensorDataReady() 实现:
+       副核解析完成 → 更新温度/湿度/光照图表
+       → 更新数值标签 (温度 °C, 湿度 %RH, 光照 lux)
+       → 更新状态标签（含异常检测和颜色变化）
+       → 数据阈值检测:
+          温度: >30°C 或 <15°C → "⚠️ 异常"
+          湿度: >80%RH 或 <30%RH → "⚠️ 异常"
+          光照: >1000lux 或 <100lux → "⚠️ 异常"
+       → 更新表格数据（6 列，含光照/设备ID/状态）
+       → 写入 SQLite 数据库持久化
+
+    d. showStatusDialog() 实现:
+       弹出对话框显示:
+       - MQTT 客户端连接状态
+       - 共享内存通道状态（基址、各通道可读/可用字节数）
+       - 数据库记录总数
+       - 读取线程运行状态
+
+    e. on_btnExport_clicked() 实现:
+       弹出 QFileDialog 选择保存路径
+       → 调用 m_db->exportToCsv() 导出全部传感器记录
+       → 默认文件名: yyyy-MM-dd_hh-mm-ss_sensor_data.csv
+
+    f. switchToLightChart() 实现:
+       切换到 stackedWidget 第 3 页 (index 2)
+       高亮光照按钮，取消高亮图表/表格按钮
+
+    g. initLightChart() 实现:
+       在 stackedWidget page(2) 上程序化构建光照图表
+       布局: 标题标签 → QChartView 容器 → 数值标签 → 状态标签
+       光照 Y 轴范围: 0-1200 lux
+
+    h. initTable() 扩展:
+       表格列从 3 列扩展到 6 列: 时间/温度/湿度/光照/设备ID/状态
+
+    i. appendTableRow() 提取为独立方法:
+       插入数据行（6 列完整数据），保持最多 10 行
+
+    j. 布局查找改为稳健方式:
+       不再使用硬编码索引 itemAt(2)
+       改为遍历查找包含 btnChartMode 的布局
+
+
+  [8] QT_MQTT_UI.pro
+  ------------------------------------------------------------------
+  修改内容:
+    a. QT += sql   (添加 SQLite 支持模块)
+    b. SOURCES += shmcommunicator.cpp databasemanager.cpp
+    c. HEADERS += sensordata.h shmcommunicator.h databasemanager.h
+
+
+四、完整数据流
+--------------------------------------------------------------------------------
+
+  ┌─────────────────────────────────────────────────────────┐
+  │                     MQTT Broker                          │
+  │                 (192.168.79.1:1883)                      │
+  │              发布 JSON 到 test/topic                      │
+  └──────────────────────┬──────────────────────────────────┘
+                         │
+  ┌──────────────────────▼──────────────────────────────────┐
+  │              主核 Qt 程序 (QT_MQTT_UI)                     │
+  │                                                           │
+  │  1. mqttClient::onMessageReceived()                       │
+  │     → emit jsonMessageReceived(QByteArray json)          │
+  │                                                           │
+  │  2. MainWindow::onMqttMessageReceived()                   │
+  │     → m_shm->sendToSecondary(json)                        │
+  │     → 写入 B→A 通道 (offset 0x2000)                       │
+  │                                                           │
+  │  3. readingDataThread (子线程, 500ms 轮询)                 │
+  │     → m_shm->recvFromSecondary()                          │
+  │     → 从 A→B 通道读取 SensorData 结构体                    │
+  │     → emit dataReady(SensorData)                          │
+  │                                                           │
+  │  4. MainWindow::onSensorDataReady()                       │
+  │     → 更新温度/湿度/光照图表                                │
+  │     → 更新数值标签 + 状态标签                               │
+  │     → 更新表格 (6 列, 10 行)                               │
+  │     → m_db->insertRecord() → SQLite 持久化                │
+  └─────────────────────────────────────────────────────────┘
+                         │ 共享内存 @ 0xb1004000
+                         │ ┌──────────────┐
+                         │ │ A→B 通道     │ ← 主核读取
+                         │ │ (副核→主核)   │
+                         │ ├──────────────┤
+                         │ │ B→A 通道     │ → 主核写入
+                         │ │ (主核→副核)   │
+                         │ └──────────────┘
+                         │
+  ┌──────────────────────▼──────────────────────────────────┐
+  │              副核 Buildroot 程序 (JsonMsgHandleCell)       │
+  │                                                           │
+  │  main() while 循环:                                       │
+  │    recv_from_root() → 从 B→A 通道读取 JSON                │
+  │    analysisSensorDataJson() → 解析 JSON → SenserData     │
+  │    send_to_root() → 写入 SensorData 到 A→B 通道           │
+  └─────────────────────────────────────────────────────────┘
+
+
+五、UI 布局变更
+--------------------------------------------------------------------------------
+
+  顶部状态栏 (topBarWidget):
+    原: [标题] ---- [spacer] ---- [statusLabel 🔴在线] [timeLabel]
+    新: [标题] ---- [spacer] ---- [m_statusLabel ●共享内存] [statusLabel 🔴在线] [timeLabel]
+
+  模式切换栏 (modeSwitchLayout):
+    原: [📊 图表模式] [📋 表格模式] ---- [spacer]
+    新: [📊 图表模式] [📋 表格模式] [💡 光照图表] [📡 设备状态] ---- [spacer]
+
+  QStackedWidget:
+    pageChart (index 0):  温度图表 + 湿度图表 (并排) + 状态标签
+    pageTable (index 1):  数据表格 (6 列: 时间/温度/湿度/光照/设备ID/状态)
+    page (index 2):       光照图表 + 数值标签 + 状态标签 (程序化构建)
+
+
+六、文件变更汇总
+--------------------------------------------------------------------------------
+
+  新增文件 (5):
+    sensordata.h              共享结构体定义
+    shmcommunicator.h         共享内存通信器声明
+    shmcommunicator.cpp       共享内存通信器实现
+    databasemanager.h         SQLite 数据库管理器声明
+    databasemanager.cpp       SQLite 数据库管理器实现
+
+  修改文件 (7):
+    mainwindow.h              新增成员/槽函数/方法
+    mainwindow.cpp            核心逻辑重写
+    mqttclient.h              新增信号 + isConnected()
+    mqttclient.cpp            信号发射 + 局部变量 bug 修复
+    readingdatathread.h       串口→共享内存，信号变更
+    readingdatathread.cpp     共享内存轮询实现
+    QT_MQTT_UI.pro            添加 sql 模块 + 新源文件
+
+  未修改文件 (4):
+    main.cpp                  无需修改
+    mainwindow.ui             无需修改（UI 元素程序化添加）
+    QT_MQTT_UI_zh_CN.ts       无需修改
+    QT_MQTT_UI.pro.user       无需修改（用户配置）
+
+
+七、关键设计说明
+--------------------------------------------------------------------------------
+
+  1. 结构体兼容性:
+     Qt 侧 SensorData (sensordata.h) 使用 #pragma pack(push, 1)
+     与副核 SenserData (handleJson.h) 使用 #pragma pack(1) 效果一致
+     总大小 = 64 + 8 + 8 + 4 + 16 + 8 = 108 字节 (ARM64, long=8)
+
+  2. 环形缓冲区协议一致性:
+     Qt 侧 shmcommunicator.cpp 与副核 commMsg.c 使用完全相同的:
+     - 数据结构 (RingBuffer)
+     - 消息格式 (2字节小端长度头 + 数据体)
+     - 空/满判断逻辑
+     - __sync_synchronize() 内存屏障
+     - 最大载荷限制 (DATA_AREA_SIZE - 3)
+
+  3. 通道方向:
+     Qt 视角:
+       B→A 通道 (offset 0x2000) = 发送通道 (Qt 写入 JSON)
+       A→B 通道 (offset 0x0000) = 接收通道 (Qt 读取解析后结构体)
+     副核视角:
+       B→A 通道 (offset 0x2000) = 接收通道 (副核读取 JSON)  ← rx_rb
+       A→B 通道 (offset 0x0000) = 发送通道 (副核写入结构体)  ← tx_rb
+     命名从副核角度出发 (A=副核, B=主核)，Qt 侧做镜像操作
+
+  4. 线程安全:
+     readingDataThread 在独立 QThread 中运行
+     使用 exec() 事件循环 + QTimer 定时轮询
+     通过 Qt 信号/槽跨线程传递数据 (dataReady 信号)
+     ShmCommunicator 方法从单一线程调用，无需额外加锁
+
+  5. 数据库路径:
+     Linux: ~/.local/share/QT_MQTT_UI/sensor_data.db
+     目录自动创建，支持自定义路径传入
+
+
+八、编译要求
+--------------------------------------------------------------------------------
+
+  Qt 模块依赖:
+    Qt5Core, Qt5Gui, Qt5Widgets, Qt5Mqtt, Qt5Charts, Qt5SerialPort, Qt5Sql
+
+  C++ 标准: C++11
+
+  构建命令:
+    qmake QT_MQTT_UI.pro
+    make
+
+  目标平台: 飞腾派 (ARM64 Linux)
+  运行前提: 主核文件系统中存在 /dev/mem 字符设备（mknod /dev/mem c 1 1）
+
+
+九、与副核程序的协作流程
+--------------------------------------------------------------------------------
+
+  1. 主核 Qt 启动 → 初始化共享内存 (/dev/mem mmap)
+  2. 副核程序启动 → 初始化共享内存 (/dev/mem mmap)
+  3. MQTT Broker 发布 JSON 传感器数据到 test/topic
+  4. 主核 mqttClient 收到 JSON → 写入 B→A 通道
+  5. 副核 recv_from_root() 读取 JSON → analysisSensorDataJson() 解析
+  6. 副核 send_to_root() 将 SenserData 写入 A→B 通道
+  7. 主核 readingDataThread 轮询发现新数据 → recvFromSecondary()
+  8. 主核 onSensorDataReady() 更新 UI + 写入 SQLite
+
+================================================================================

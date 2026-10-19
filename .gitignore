@@ -1,0 +1,9 @@
+# 忽略内核和 Jailhouse 源码
+linux/
+jailhouse/
+u-boot/
+# 忽略编译产物
+*.o
+*.bin
+*.img
+*.dtb
