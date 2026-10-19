@@ -1,0 +1,2 @@
+# e2000q_jailhouse_multi-core_insulate
+基于飞腾派适配jailhouse的多核异构可行框架
